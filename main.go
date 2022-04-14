@@ -6,10 +6,21 @@ import (
 	"os"
 	"log"
 	"path/filepath"
+	"context"
+	"io"
+	"database/sql"
+	"time"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/go-git/go-git/v5"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/docker/docker/daemon/logger/jsonfilelog"
 )
 
 type input struct {
@@ -20,11 +31,39 @@ type output struct {
 	ScanId string `json:"scan_id"`
 }
 
+type errorType struct {
+	Error bool `json:"error"`
+	Message string `json:"message"`
+}
+
+type scan struct {
+	Id string `json:"id"`
+	Time string `json:"time"`
+	Content string `json:"content"`
+}
+
+func handleError(err error, msg string, c *gin.Context) {
+	newError := errorType{Error: true, Message: msg}
+	c.IndentedJSON(http.StatusCreated, newError)
+	fmt.Fprintf(os.Stderr, fmt.Sprintf("%s\n", err))
+}
+
+func databaseConnection(c *gin.Context) (*sql.DB) {
+	db, err := sql.Open("sqlite3", "./ohno.db")
+	if err != nil {
+		handleError(err, "Database connection error.", c)
+		return db
+	}
+
+	return db
+}
+
 func main() {
 	router := gin.Default()
 
-	router.GET("ping", ping)
-	router.POST("newscan", newScan)
+	router.GET("/ping", ping)
+	router.POST("/newscan", createScan)
+	router.GET("/scan/:scan_id", viewScan)
 
 	router.Run("localhost:8080")
 
@@ -35,7 +74,7 @@ func ping(c *gin.Context) {
 	c.JSON(http.StatusOK, "pong")
 }
 
-func newScan(c *gin.Context) {
+func createScan(c *gin.Context) {
 	var newInput input
 	var newOutput output
 
@@ -55,11 +94,119 @@ func newScan(c *gin.Context) {
 		URL:	newInput.Url,
 		Progress: os.Stdout,
 	})
-
 	if err != nil {
-		log.Fatal(err)
+		handleError(err, "Repo cloning error.", c)
+		return
+	}
+
+	// Docker
+	// Simulating "docker run --rm -v ${PWD}:/code opensorcery/bandit -r /code"
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		handleError(err, "Context error.", c)
+		return
+	}
+
+	reader, err := cli.ImagePull(ctx, "opensorcery/bandit", types.ImagePullOptions{})
+	if err != nil {
+		handleError(err, "Bandit Docker image pull error.", c)
+		return
+	}
+	io.Copy(os.Stdout, reader)
+
+	resp, err := cli.ContainerCreate(ctx, &container.Config{
+		Image: "opensorcery/bandit",
+		Shell: []string{"-r", "/code"},
+	}, &container.HostConfig{
+			Mounts: []mount.Mount{
+				{	
+					Type: mount.TypeBind,
+					Source: clonePath,
+					Target: "/code",
+				},
+			},
+			LogConfig: container.LogConfig{
+				Type: jsonfilelog.Name,
+			},
+			AutoRemove: true,
+		}, nil, nil, "")
+	if err != nil {
+		handleError(err, "Bandit container create error.", c)
+		return
+	}
+
+	if err := cli.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
+		handleError(err, "Bandit container start error.", c)
+		return
+	}
+
+	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			handleError(err, "Bandit container wait error.", c)
+			return
+		}
+	case <-statusCh:
+	}
+
+	out, err := cli.ContainerLogs(ctx, resp.ID, types.ContainerLogsOptions{ShowStdout: true})
+	if err != nil {
+		handleError(err, "Bandit container logging error.", c)
+		return
+	}
+	
+	buf := new(strings.Builder)
+	testResult, err := io.Copy(buf, out)
+
+	fmt.Println(testResult)
+	fmt.Println(err)
+
+	// Save to database
+	db := databaseConnection(c);
+
+	stmt, err := db.Prepare("INSERT INTO scans(id, time, content) VALUES(?, ?, ?)")
+	if err != nil {
+		handleError(err, "Query error.", c)
+		return
+	}
+
+	_, err = stmt.Exec(newOutput.ScanId, time.Now(), buf.String())
+	if err != nil {
+		handleError(err, "Database insert error.", c)
+		return
 	}
 
 	// Return Scan ID output
 	c.IndentedJSON(http.StatusCreated, newOutput)
+}
+
+func viewScan(c *gin.Context) {
+	scanId := c.Param("scan_id")
+
+	var currentScan scan
+
+	db := databaseConnection(c);
+
+	stmt, err := db.Prepare("SELECT id, time, content FROM scans WHERE id = ?")
+	if err != nil {
+		handleError(err, "Query error.", c)
+		return
+	}
+
+	err = stmt.QueryRow(scanId).Scan(&currentScan.Id, &currentScan.Time, &currentScan.Content)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			handleError(err, "Database select error.", c)
+			return
+		}
+
+		c.JSON(http.StatusOK, currentScan.Content)
+		return
+	}
+
+	stmt.Close()
+
+	c.JSON(http.StatusOK, currentScan.Content)
 }
