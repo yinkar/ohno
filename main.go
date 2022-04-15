@@ -8,19 +8,17 @@ import (
 	"path/filepath"
 	"context"
 	"io"
+	"io/ioutil"
 	"database/sql"
 	"time"
-	"strings"
-
+	
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/go-git/go-git/v5"
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/docker/docker/daemon/logger/jsonfilelog"
 )
 
 type input struct {
@@ -117,19 +115,15 @@ func createScan(c *gin.Context) {
 
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
 		Image: "opensorcery/bandit",
-		Shell: []string{"-r", "/code"},
+		Cmd: []string{"-r", "/code", "-f", "json"},
 	}, &container.HostConfig{
-			Mounts: []mount.Mount{
-				{	
-					Type: mount.TypeBind,
-					Source: clonePath,
-					Target: "/code",
-				},
-			},
 			LogConfig: container.LogConfig{
-				Type: jsonfilelog.Name,
+				Type:   "json-file",
+				Config: map[string]string{},
 			},
-			AutoRemove: true,
+			Binds: []string{
+				fmt.Sprintf("%s:/code", clonePath),
+			},
 		}, nil, nil, "")
 	if err != nil {
 		handleError(err, "Bandit container create error.", c)
@@ -153,15 +147,20 @@ func createScan(c *gin.Context) {
 
 	out, err := cli.ContainerLogs(ctx, resp.ID, types.ContainerLogsOptions{ShowStdout: true})
 	if err != nil {
-		handleError(err, "Bandit container logging error.", c)
+		handleError(err, "Bandit container log error.", c)
 		return
 	}
-	
-	buf := new(strings.Builder)
-	testResult, err := io.Copy(buf, out)
+
+	//	stdcopy.StdCopy(os.Stdout, os.Stderr, out)
+	f, err := os.Create("/tmp/clogs")
+	io.Copy(f, out)
+	f.Close()
+
+	data, _ := ioutil.ReadFile("/tmp/clogs")
+	testResult := string(data)
 
 	fmt.Println(testResult)
-	fmt.Println(err)
+
 
 	// Save to database
 	db := databaseConnection(c);
@@ -172,11 +171,13 @@ func createScan(c *gin.Context) {
 		return
 	}
 
-	_, err = stmt.Exec(newOutput.ScanId, time.Now(), buf.String())
+	_, err = stmt.Exec(newOutput.ScanId, time.Now(), testResult)
 	if err != nil {
 		handleError(err, "Database insert error.", c)
 		return
 	}
+
+	db.Close()
 
 	// Return Scan ID output
 	c.IndentedJSON(http.StatusCreated, newOutput)
@@ -207,6 +208,8 @@ func viewScan(c *gin.Context) {
 	}
 
 	stmt.Close()
+
+	db.Close()
 
 	c.JSON(http.StatusOK, currentScan.Content)
 }
