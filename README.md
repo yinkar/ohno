@@ -3,10 +3,6 @@
 OhNo is a vulnerability scanner for Python scripts that stands on [Bandit](https://github.com/PyCQA/bandit).
 
 ## Usage
-### Starting server
-```bash
-go run .
-```
 
 ### New Scan
 #### Request
